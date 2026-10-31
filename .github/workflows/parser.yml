@@ -2,7 +2,7 @@ name: PC parser
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # каждые 15 минут (GitHub может запускать с опозданием)
+        - cron: "7,22,37,52 * * * *"   # каждые 15 минут (GitHub может запускать с опозданием)
   workflow_dispatch:          # кнопка ручного запуска
 
 permissions:
