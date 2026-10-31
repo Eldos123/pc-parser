@@ -2,8 +2,13 @@ name: PC parser
 
 on:
   schedule:
-        - cron: "7,22,37,52 * * * *"   # каждые 15 минут (GitHub может запускать с опозданием)
+    - cron: "7,22,37,52 * * * *"   # каждые 15 минут, неровные минуты (GitHub может запускать с опозданием)
   workflow_dispatch:          # кнопка ручного запуска
+    inputs:
+      notify_all:
+        description: "Прислать в Telegram все объявления (когда seen.json пустой)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write             # чтобы сохранять seen.json обратно в репозиторий
@@ -31,7 +36,7 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python pc_parser.py
+        run: python pc_parser.py ${{ inputs.notify_all && '--notify-all' || '' }}
 
       - name: Сохранить seen.json
         if: always()
