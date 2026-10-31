@@ -318,14 +318,26 @@ def notify(item: dict) -> None:
 
     token, chat = os.getenv("TG_BOT_TOKEN"), os.getenv("TG_CHAT_ID")
     if token and chat:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat, "text": msg, "disable_web_page_preview": False},
-                timeout=15,
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[Telegram] не отправилось: {e}", file=sys.stderr)
+        # Telegram ограничивает частоту сообщений: при ответе 429 ждём и пробуем снова,
+        # между сообщениями — пауза, чтобы порядок сохранился и ничего не потерялось.
+        for _ in range(3):
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat, "text": msg, "disable_web_page_preview": False},
+                    timeout=15,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[Telegram] не отправилось: {e}", file=sys.stderr)
+                break
+            if r.status_code == 429:
+                wait = (r.json().get("parameters") or {}).get("retry_after", 5)
+                time.sleep(wait + 1)
+                continue
+            if r.status_code != 200:
+                print(f"[Telegram] ответ {r.status_code}: {r.text[:200]}", file=sys.stderr)
+            break
+        time.sleep(1.1)
 
 
 # ---------------------------------------------------------------- main
@@ -355,7 +367,9 @@ def run_once(first_run_silent: bool) -> None:
                 print(f"  {fmt_price(it['price']):>15} | {it['city']} | {it['title'][:60]} | {it['url']}")
         new = [it for it in new if it.get("city") not in fresh]
     seen.update(f"city:{c}" for c in CITIES)
-    new.sort(key=lambda it: it["price"] or 10**12)
+    # Сначала города в порядке CITIES (Астана, потом Алматы), внутри — от дешёвых к дорогим
+    city_order = {c: i for i, c in enumerate(CITIES)}
+    new.sort(key=lambda it: (city_order.get(it.get("city"), len(CITIES)), it["price"] or 10**12))
 
     print(f"Найдено подходящих: {len(found)}, новых: {len(new)}")
     if is_first and first_run_silent:
@@ -371,6 +385,12 @@ def run_once(first_run_silent: bool) -> None:
 
 
 def main() -> None:
+    # консоль Windows не умеет эмодзи — не падаем, а заменяем их на «?»
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except AttributeError:
+            pass
     ap = argparse.ArgumentParser(description="Поиск ПК в Астане и Алматы на OLX")
     ap.add_argument("--loop", type=int, default=0, help="повторять каждые N минут")
     ap.add_argument("--notify-all", action="store_true",
