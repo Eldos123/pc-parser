@@ -1,14 +1,12 @@
 """
-Парсер объявлений о ПК в Астане: OLX.kz + Threads.
+Парсер объявлений о ПК в Астане и Алматы на OLX.kz.
 
 Ищет объявления с Ryzen 7 7800X3D / 9800X3D и RTX 5070 / 5070 Ti / 5080,
-оставляет только Астану, запоминает уже виденные и присылает новые
-в Telegram (или просто печатает в консоль).
+оставляет только города из CITIES, запоминает уже виденные и присылает новые
+в Telegram с пометкой города (или просто печатает в консоль).
 
 Установка:
-    pip install requests curl_cffi playwright
-    python -m playwright install chromium
-    python pc_parser.py --threads-login   # один раз войти в Threads
+    pip install requests curl_cffi
 
 Запуск:
     python pc_parser.py            # один проход
@@ -20,12 +18,6 @@
                       https://api.telegram.org/bot<TOKEN>/getUpdates)
     MAX_PRICE         максимальная цена в тенге, например 1100000
     REQUIRE_BOTH      по умолчанию 1 = нужны И CPU, И GPU из списка; 0 = хватит одного
-
-Про Threads: поиск идёт через браузер Chromium под вашим аккаунтом.
-Один раз выполните  python pc_parser.py --threads-login, войдите в Threads
-в открывшемся окне и нажмите Enter в терминале. Вход сохранится в папке
-threads_profile. Если поиск не работает в фоне, задайте THREADS_HEADLESS=0 —
-тогда окно браузера будет видно.
 """
 
 import argparse
@@ -73,7 +65,19 @@ GPU_PATTERNS = {
     "RTX 5070": re.compile(r"(?<!\d)5070(?!\d)(?!" + TI + ")", re.I),
 }
 
-ASTANA_RE = re.compile(r"астан|astana|нур-?султан|nur-?sultan|акмол", re.I)
+# Города, в которых ищем: название → (как узнать в тексте, адрес города на OLX)
+CITIES = {
+    "Астана": (re.compile(r"астан|astana|нур-?султан|nur-?sultan|акмол", re.I), "astana"),
+    "Алматы": (re.compile(r"алмат|almaty|алма-?ат", re.I), "almaty"),
+}
+
+
+def city_of(text: str) -> str | None:
+    """Первый из наших городов, упомянутый в тексте, или None."""
+    for name, (rx, _) in CITIES.items():
+        if rx.search(text or ""):
+            return name
+    return None
 
 # Признаки того, что продаётся целый компьютер
 PC_RE = re.compile(
@@ -173,7 +177,7 @@ def fmt_price(price: int | None) -> str:
 # ---------------------------------------------------------------- OLX.kz
 
 OLX_API = "https://www.olx.kz/api/v1/offers/"
-OLX_HTML = "https://www.olx.kz/astana/q-{q}/"
+OLX_HTML = "https://www.olx.kz/{city}/q-{q}/"
 _olx_warmed = False
 OLX_FAILS = 0
 
@@ -213,14 +217,14 @@ def olx_price(offer: dict) -> int | None:
     return int(digits) if digits else None
 
 
-def olx_is_astana(offer: dict) -> bool:
+def olx_city(offer: dict) -> str | None:
     loc = offer.get("location") or {}
-    names = " ".join([
-        str(loc.get("cityName", "")), str(loc.get("regionName", "")),
-        *(str((loc.get(k) or {}).get(f, "")) for k in ("city", "region")
-          for f in ("name", "normalized_name")),
-    ])
-    return bool(ASTANA_RE.search(names))
+    # сначала сам город, потом область
+    city = " ".join([str(loc.get("cityName", "")),
+                     *(str((loc.get("city") or {}).get(f, "")) for f in ("name", "normalized_name"))])
+    region = " ".join([str(loc.get("regionName", "")),
+                       *(str((loc.get("region") or {}).get(f, "")) for f in ("name", "normalized_name"))])
+    return city_of(city) or city_of(region)
 
 
 def olx_from_api(query: str) -> list[dict] | None:
@@ -235,7 +239,17 @@ def olx_from_api(query: str) -> list[dict] | None:
 
 
 def olx_from_html(query: str) -> list[dict] | None:
-    url = OLX_HTML.format(q=re.sub(r"\s+", "-", query.strip()))
+    ads, ok = [], False
+    for name, (_, slug) in CITIES.items():
+        part = olx_from_html_city(query, name, slug)
+        if part is not None:
+            ok = True
+            ads.extend(part)
+    return ads if ok else None
+
+
+def olx_from_html_city(query: str, city: str, slug: str) -> list[dict] | None:
+    url = OLX_HTML.format(city=slug, q=re.sub(r"\s+", "-", query.strip()))
     try:
         r = olx_get(url, headers={"Accept": "text/html", "Accept-Language": "ru-RU,ru;q=0.9"})
         if r.status_code != 200:
@@ -247,9 +261,9 @@ def olx_from_html(query: str) -> list[dict] | None:
             return None
         state = json.loads(json.loads(m.group(1)))
         ads = (state.get("listing") or {}).get("listing", {}).get("ads", [])
-        # на странице /astana/ все объявления уже из Астаны
+        # на странице города (/astana/, /almaty/) все объявления уже из него
         for ad in ads:
-            ad.setdefault("location", {}).setdefault("cityName", "Астана")
+            ad.setdefault("location", {}).setdefault("cityName", city)
         return ads
     except Exception as e:  # noqa: BLE001
         print(f"[OLX] ошибка разбора страницы: {e}", file=sys.stderr)
@@ -268,7 +282,8 @@ def search_olx(query: str) -> list[dict]:
 
     results = []
     for offer in data:
-        if not olx_is_astana(offer):
+        city = olx_city(offer)
+        if not city:
             continue
         price = olx_price(offer)
         ok, cpus, gpus = is_relevant(offer.get("title", ""), offer.get("description", ""), price)
@@ -277,6 +292,7 @@ def search_olx(query: str) -> list[dict]:
         results.append({
             "id": f"olx:{offer.get('id')}",
             "source": "OLX",
+            "city": city,
             "title": (offer.get("title") or "").strip(),
             "price": price,
             "url": offer.get("url"),
@@ -284,173 +300,6 @@ def search_olx(query: str) -> list[dict]:
             "cpus": cpus,
             "gpus": gpus,
         })
-    return results
-
-
-# ---------------------------------------------------------------- Threads
-
-# Поиск через браузер под вашим аккаунтом (Playwright).
-# Один раз: python pc_parser.py --threads-login  → войти в Threads в открывшемся окне.
-THREADS_PROFILE = Path(__file__).with_name("threads_profile")
-THREADS_QUERIES = [
-    "7800x3d",
-    "9800x3d",
-    "продам пк 7800x3d",
-    "продам пк 9800x3d",
-    "продам пк 5070",
-    "продам пк 5070 ti",
-    "продам пк 5080",
-    "игровой пк астана",
-]
-
-# Другие города — такие посты пропускаем
-OTHER_CITY_RE = re.compile(
-    r"алмат|almaty|шымкент|атырау|актоб|актау|караганд|павлодар|костанай|кустанай|"
-    r"усть-?каменог|өскемен|семей|тараз|уральск|орал|петропавл|кокшетау|туркестан|"
-    r"кызылорд|талдыкорган|экибастуз|жезказган|темиртау|"
-    r"москв|санкт|спб|питер|екатеринбург|новосибирск|казань|бишкек|ташкент|минск|киев",
-    re.I,
-)
-KZT_RE = re.compile(r"тг|тенге|₸|kzt", re.I)
-FOREIGN_MONEY_RE = re.compile(r"₽|руб|грн|\bсом\b|\bсум\b|\$|usd|€", re.I)
-THREADS_HEADLESS = os.getenv("THREADS_HEADLESS", "1") == "1"
-_threads_warned = False
-
-def threads_price(text: str) -> int | None:
-    """Ищет цену: «1 200 000 тг», «1.2 млн», «950к», «950 000₸»."""
-    best = None
-    for m in re.finditer(r"(\d[\d\s.,]*\d|\d)\s*(млн|mln|кк|тыс|k|к)?\s*(тг|тенге|₸|kzt)?", text, re.I):
-        num, mult, cur = m.group(1), (m.group(2) or "").lower(), m.group(3)
-        if not mult and not cur:
-            continue
-        try:
-            if mult in ("млн", "mln", "кк"):
-                val = float(num.replace(" ", "").replace(",", ".")) * 1_000_000
-            elif mult in ("тыс", "k", "к"):
-                val = float(num.replace(" ", "").replace(",", ".")) * 1_000
-            else:
-                val = float(re.sub(r"\D", "", num))
-        except ValueError:
-            continue
-        if 100_000 <= val <= 10_000_000:   # правдоподобная цена ПК
-            best = int(val)
-            break
-    return best
-
-
-JS_COLLECT_POSTS = r"""
-() => {
-  const out = [];
-  const seen = new Set();
-  for (const a of document.querySelectorAll('a[href*="/post/"]')) {
-    const m = a.getAttribute('href').match(/\/@([^/]+)\/post\/([^/?#]+)/);
-    if (!m || seen.has(m[2])) continue;
-    // ссылка-время поста содержит <time>
-    if (!a.querySelector('time')) continue;
-    let box = a.closest('[data-pressable-container="true"]');
-    if (!box) { box = a; for (let i = 0; i < 8 && box.parentElement; i++) box = box.parentElement; }
-    seen.add(m[2]);
-    out.push({
-      id: m[2], user: m[1],
-      url: 'https://www.threads.com/@' + m[1] + '/post/' + m[2],
-      time: a.querySelector('time').getAttribute('datetime'),
-      text: box.innerText || ''
-    });
-  }
-  return out;
-}
-"""
-
-
-def threads_login() -> None:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("Сначала установите: pip install playwright  и  python -m playwright install chromium")
-        return
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(str(THREADS_PROFILE), headless=False,
-                                                   locale="ru-RU")
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto("https://www.threads.com/login")
-        input("Войдите в Threads в открывшемся окне, затем нажмите Enter здесь... ")
-        ctx.close()
-    print("Готово, вход сохранён в папке threads_profile.")
-
-
-def search_threads_browser() -> list[dict]:
-    global _threads_warned
-    if not THREADS_PROFILE.exists():
-        if not _threads_warned:
-            print("[Threads] пропущен: сначала выполните  python pc_parser.py --threads-login",
-                  file=sys.stderr)
-            _threads_warned = True
-        return []
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        if not _threads_warned:
-            print("[Threads] пропущен: pip install playwright && python -m playwright install chromium",
-                  file=sys.stderr)
-            _threads_warned = True
-        return []
-
-    results = []
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            str(THREADS_PROFILE), headless=THREADS_HEADLESS, locale="ru-RU",
-            viewport={"width": 1280, "height": 1600})
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        for q in THREADS_QUERIES:
-            url = "https://www.threads.com/search?q=" + requests.utils.quote(q) + "&serp_type=default&filter=recent"
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                if "/login" in page.url:
-                    print("[Threads] вход слетел — повторите  python pc_parser.py --threads-login",
-                          file=sys.stderr)
-                    break
-                page.wait_for_timeout(4000)
-                for _ in range(6):               # подгружаем больше постов
-                    page.mouse.wheel(0, 3000)
-                    page.wait_for_timeout(1500)
-                posts = page.evaluate(JS_COLLECT_POSTS)
-            except Exception as e:  # noqa: BLE001
-                print(f"[Threads] ошибка по «{q}»: {e}", file=sys.stderr)
-                continue
-
-            n_astana = sum(1 for x in posts if ASTANA_RE.search(x.get("text", "")))
-            if os.getenv("THREADS_DEBUG") == "1":
-                print(f"[Threads] «{q}»: постов на странице {len(posts)}, с Астаной {n_astana}")
-            if os.getenv("THREADS_DEBUG") == "1":
-                for x in posts[:5]:
-                    print("   ·", x.get("text", "").replace("\n", " ")[:150])
-            for post in posts:
-                text = post.get("text", "")
-                in_astana = bool(ASTANA_RE.search(text))
-                if not in_astana:
-                    # город не указан: берём, если цена в тенге и других городов нет
-                    if OTHER_CITY_RE.search(text) or FOREIGN_MONEY_RE.search(text) \
-                            or not KZT_RE.search(text):
-                        continue
-                price = threads_price(text)
-                ok, cpus, gpus = is_relevant(text, text, price)
-                if not ok:
-                    continue
-                lines = [l for l in text.splitlines() if l.strip() and l.strip() != post["user"]]
-                title = next((l for l in lines if len(l) > 15), lines[0] if lines else "")[:120]
-                results.append({
-                    "id": f"threads:{post['id']}",
-                    "source": f"Threads @{post['user']}" + ("" if in_astana else " (город не указан)"),
-                    "title": title.strip(),
-                    "price": price,
-                    "url": post["url"],
-                    "date": post.get("time"),
-                    "cpus": cpus,
-                    "gpus": gpus,
-                })
-            time.sleep(2)
-        ctx.close()
-    print(f"[Threads] подходящих постов: {len(results)}")
     return results
 
 
@@ -462,7 +311,7 @@ def notify(item: dict) -> None:
         f"🖥 {item['title']}\n"
         f"💰 {fmt_price(item['price'])}\n"
         f"🔧 {', '.join(parts)}\n"
-        f"📍 {item['source']}\n"
+        f"📍 {item['city']} · {item['source']}\n"
         f"{item['url']}"
     )
     print(msg, "\n" + "-" * 40)
@@ -490,19 +339,22 @@ def run_once(first_run_silent: bool) -> None:
         for item in search_olx(q):
             found.setdefault(item["id"], item)
         time.sleep(1)
-    for item in search_threads_browser():
-        found.setdefault(item["id"], item)
 
     new = [it for it in found.values() if it["id"] not in seen]
 
-    # Первый раз для Threads — тоже без спама в Telegram
-    if not is_first and first_run_silent and not any(s.startswith("threads:") for s in seen):
-        th_new = [it for it in new if it["id"].startswith("threads:")]
-        if th_new:
-            print("Первый запуск Threads: найденные посты (без уведомлений):")
-            for it in th_new:
-                print(f"  {fmt_price(it['price']):>15} | {it['title'][:70]} | {it['url']}")
-        new = [it for it in new if not it["id"].startswith("threads:")]
+    # Новый город в CITIES — его текущие объявления тоже запоминаем без спама.
+    # В seen хранится метка «city:<название>» для уже знакомых городов.
+    if not is_first and not any(s.startswith("city:") for s in seen):
+        seen.add("city:Астана")        # старый seen.json — Астана уже знакома
+    if not is_first and first_run_silent:
+        fresh = [c for c in CITIES if f"city:{c}" not in seen]
+        silent = [it for it in new if it.get("city") in fresh]
+        if silent:
+            print(f"Первый запуск для {', '.join(fresh)}: найденные объявления (без уведомлений):")
+            for it in silent:
+                print(f"  {fmt_price(it['price']):>15} | {it['city']} | {it['title'][:60]} | {it['url']}")
+        new = [it for it in new if it.get("city") not in fresh]
+    seen.update(f"city:{c}" for c in CITIES)
     new.sort(key=lambda it: it["price"] or 10**12)
 
     print(f"Найдено подходящих: {len(found)}, новых: {len(new)}")
@@ -519,17 +371,11 @@ def run_once(first_run_silent: bool) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Поиск ПК в Астане на OLX и Threads")
+    ap = argparse.ArgumentParser(description="Поиск ПК в Астане и Алматы на OLX")
     ap.add_argument("--loop", type=int, default=0, help="повторять каждые N минут")
     ap.add_argument("--notify-all", action="store_true",
                     help="на первом запуске тоже слать всё в Telegram")
-    ap.add_argument("--threads-login", action="store_true",
-                    help="один раз войти в Threads в окне браузера")
     args = ap.parse_args()
-
-    if args.threads_login:
-        threads_login()
-        return
 
     while True:
         global OLX_FAILS
