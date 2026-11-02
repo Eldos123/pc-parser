@@ -120,15 +120,20 @@ REQUIRE_BOTH = os.getenv("REQUIRE_BOTH", "1") == "1"
 
 # ---------------------------------------------------------------- утилиты
 
-def load_seen() -> set:
+def load_seen() -> dict:
+    """id объявления → последняя известная цена (None, если неизвестна)."""
     try:
-        return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+        return {}
+    if isinstance(data, list):         # старый формат — только список id, без цен
+        return dict.fromkeys(data)
+    return data
 
 
-def save_seen(seen: set) -> None:
-    SEEN_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False), encoding="utf-8")
+def save_seen(seen: dict) -> None:
+    SEEN_FILE.write_text(json.dumps(dict(sorted(seen.items())), ensure_ascii=False, indent=0),
+                         encoding="utf-8")
 
 
 def detect_models(text: str) -> tuple[list, list]:
@@ -217,6 +222,16 @@ def olx_price(offer: dict) -> int | None:
     return int(digits) if digits else None
 
 
+def olx_state(offer: dict) -> str | None:
+    """Состояние из параметров объявления: «Б/у» или «Новый»."""
+    for p in offer.get("params", []) or []:
+        if p.get("key") == "state":
+            val = p.get("value")
+            # API: {"key": "used", "label": "Б/у"}; HTML-страница: "Б/у"
+            return (val.get("label") if isinstance(val, dict) else val) or None
+    return None
+
+
 def olx_city(offer: dict) -> str | None:
     loc = offer.get("location") or {}
     # сначала сам город, потом область
@@ -293,6 +308,7 @@ def search_olx(query: str) -> list[dict]:
             "id": f"olx:{offer.get('id')}",
             "source": "OLX",
             "city": city,
+            "state": olx_state(offer),
             "title": (offer.get("title") or "").strip(),
             "price": price,
             "url": offer.get("url"),
@@ -305,11 +321,19 @@ def search_olx(query: str) -> list[dict]:
 
 # ---------------------------------------------------------------- уведомления
 
-def notify(item: dict) -> None:
+def notify(item: dict, old_price: int | None = None) -> None:
     parts = item["cpus"] + item["gpus"]
+    if old_price:
+        diff = item["price"] - old_price
+        sign = "📉 подешевело" if diff < 0 else "📈 подорожало"
+        price_line = (f"🔄 Цена изменилась: {fmt_price(old_price)} → {fmt_price(item['price'])}\n"
+                      f"{sign} на {fmt_price(abs(diff))}")
+    else:
+        price_line = f"💰 {fmt_price(item['price'])}"
     msg = (
         f"🖥 {item['title']}\n"
-        f"💰 {fmt_price(item['price'])}\n"
+        f"{price_line}\n"
+        f"🏷 {item.get('state') or 'состояние не указано'}\n"
         f"🔧 {', '.join(parts)}\n"
         f"📍 {item['city']} · {item['source']}\n"
         f"{item['url']}"
@@ -353,11 +377,14 @@ def run_once(first_run_silent: bool) -> None:
         time.sleep(1)
 
     new = [it for it in found.values() if it["id"] not in seen]
+    # Уже знакомые объявления, у которых поменялась цена (старая цена должна быть известна)
+    changed = [it for it in found.values()
+               if seen.get(it["id"]) and it["price"] and it["price"] != seen[it["id"]]]
 
     # Новый город в CITIES — его текущие объявления тоже запоминаем без спама.
     # В seen хранится метка «city:<название>» для уже знакомых городов.
     if not is_first and not any(s.startswith("city:") for s in seen):
-        seen.add("city:Астана")        # старый seen.json — Астана уже знакома
+        seen["city:Астана"] = None     # старый seen.json — Астана уже знакома
     if not is_first and first_run_silent:
         fresh = [c for c in CITIES if f"city:{c}" not in seen]
         silent = [it for it in new if it.get("city") in fresh]
@@ -366,12 +393,15 @@ def run_once(first_run_silent: bool) -> None:
             for it in silent:
                 print(f"  {fmt_price(it['price']):>15} | {it['city']} | {it['title'][:60]} | {it['url']}")
         new = [it for it in new if it.get("city") not in fresh]
-    seen.update(f"city:{c}" for c in CITIES)
+    for c in CITIES:
+        seen.setdefault(f"city:{c}", None)
     # Сначала города в порядке CITIES (Астана, потом Алматы), внутри — от дешёвых к дорогим
     city_order = {c: i for i, c in enumerate(CITIES)}
-    new.sort(key=lambda it: (city_order.get(it.get("city"), len(CITIES)), it["price"] or 10**12))
+    order = lambda it: (city_order.get(it.get("city"), len(CITIES)), it["price"] or 10**12)  # noqa: E731
+    new.sort(key=order)
+    changed.sort(key=order)
 
-    print(f"Найдено подходящих: {len(found)}, новых: {len(new)}")
+    print(f"Найдено подходящих: {len(found)}, новых: {len(new)}, с новой ценой: {len(changed)}")
     if is_first and first_run_silent:
         print("Первый запуск: запоминаю текущие объявления без уведомлений в Telegram.")
         for it in new:
@@ -379,8 +409,13 @@ def run_once(first_run_silent: bool) -> None:
     else:
         for it in new:
             notify(it)
+    for it in changed:
+        notify(it, old_price=seen[it["id"]])
 
-    seen.update(found.keys())
+    # Запоминаем цены; если в этот раз цена не распознана — оставляем прежнюю
+    for id_, it in found.items():
+        if it["price"] or id_ not in seen:
+            seen[id_] = it["price"]
     save_seen(seen)
 
 
