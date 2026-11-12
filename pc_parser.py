@@ -1,7 +1,7 @@
 """
-Парсер объявлений о ПК в Астане и Алматы на OLX.kz.
+Парсер объявлений о ПК и PS5 Pro в Астане и Алматы на OLX.kz.
 
-Ищет объявления с Ryzen 7 7800X3D / 9800X3D и RTX 5070 / 5070 Ti / 5080,
+Ищет ПК с Ryzen 7 7800X3D / 9800X3D и RTX 5070 / 5070 Ti / 5080 и консоли PS5 Pro,
 оставляет только города из CITIES, запоминает уже виденные и присылает новые
 в Telegram с пометкой города (или просто печатает в консоль).
 
@@ -43,12 +43,18 @@ except ImportError:
 
 # ---------------------------------------------------------------- настройки
 
+# Что ищем: код → название. Порядок важен: в Telegram сначала ПК, потом PS5 Pro.
+KINDS = {"pc": "ПК", "ps5": "PS5 Pro"}
+
+# (запрос на OLX, что ищем)
 SEARCH_QUERIES = [
-    "7800x3d",
-    "9800x3d",
-    "rtx 5070",
-    "5070 ti",
-    "rtx 5080",
+    ("7800x3d", "pc"),
+    ("9800x3d", "pc"),
+    ("rtx 5070", "pc"),
+    ("5070 ti", "pc"),
+    ("rtx 5080", "pc"),
+    ("ps5 pro", "ps5"),
+    ("playstation 5 pro", "ps5"),
 ]
 
 # Как распознавать модели в тексте (порядок важен: 5070 Ti раньше 5070).
@@ -175,6 +181,26 @@ def is_relevant(title: str, description: str, price: int | None) -> tuple[bool, 
     return True, cpus, gpus
 
 
+# PS5 Pro: «PS5 Pro», «Ps 5 PRO», «PlayStation 5 Pro», «Плейстейшен 5 ПРО», «пс5 про»
+PS5_PRO_RE = re.compile(
+    r"(?<![a-zа-я])(ps|пс|play\s*station|плэ?ейстейш[еоа]н|плейстейшн)\s*-?\s*5\s*-?\s*(pro|про)(?![a-zа-я])",
+    re.I,
+)
+# Магазины пишут «Slim / Digital / Pro» одной строкой — это не про PS5 Pro
+PS5_OTHER_RE = re.compile(r"slim|слим|\bfat\b|\bфат\b|digital|диджитал|дижитал", re.I)
+# Дешевле — это аксессуары (дисковод, сумка, подставка, геймпад), а не сама консоль
+PS5_MIN_PRICE = 300_000
+
+
+def is_ps5_pro(title: str, price: int | None) -> bool:
+    title = title or ""
+    if TITLE_EXCLUDE_RE.search(title) or PS5_OTHER_RE.search(title):
+        return False
+    if not PS5_PRO_RE.search(title):
+        return False
+    return not (price and price < PS5_MIN_PRICE)
+
+
 def fmt_price(price: int | None) -> str:
     return f"{price:,} ₸".replace(",", " ") if price else "цена не указана"
 
@@ -285,7 +311,7 @@ def olx_from_html_city(query: str, city: str, slug: str) -> list[dict] | None:
         return None
 
 
-def search_olx(query: str) -> list[dict]:
+def search_olx(query: str, kind: str = "pc") -> list[dict]:
     data = olx_from_api(query)
     if data is None:
         data = olx_from_html(query)
@@ -301,11 +327,15 @@ def search_olx(query: str) -> list[dict]:
         if not city:
             continue
         price = olx_price(offer)
-        ok, cpus, gpus = is_relevant(offer.get("title", ""), offer.get("description", ""), price)
+        if kind == "ps5":
+            ok, cpus, gpus = is_ps5_pro(offer.get("title", ""), price), [], []
+        else:
+            ok, cpus, gpus = is_relevant(offer.get("title", ""), offer.get("description", ""), price)
         if not ok:
             continue
         results.append({
             "id": f"olx:{offer.get('id')}",
+            "kind": kind,
             "source": "OLX",
             "city": city,
             "state": olx_state(offer),
@@ -330,11 +360,15 @@ def notify(item: dict, old_price: int | None = None) -> None:
                       f"{sign} на {fmt_price(abs(diff))}")
     else:
         price_line = f"💰 {fmt_price(item['price'])}"
+    if item.get("kind") == "ps5":
+        icon, spec_line = "🎮", "🎮 PlayStation 5 Pro"
+    else:
+        icon, spec_line = "🖥", f"🔧 {', '.join(parts)}"
     msg = (
-        f"🖥 {item['title']}\n"
+        f"{icon} {item['title']}\n"
         f"{price_line}\n"
         f"🏷 {item.get('state') or 'состояние не указано'}\n"
-        f"🔧 {', '.join(parts)}\n"
+        f"{spec_line}\n"
         f"📍 {item['city']} · {item['source']}\n"
         f"{item['url']}"
     )
@@ -371,8 +405,8 @@ def run_once(first_run_silent: bool) -> None:
     is_first = not seen
     found: dict[str, dict] = {}
 
-    for q in SEARCH_QUERIES:
-        for item in search_olx(q):
+    for q, kind in SEARCH_QUERIES:
+        for item in search_olx(q, kind):
             found.setdefault(item["id"], item)
         time.sleep(1)
 
@@ -381,23 +415,33 @@ def run_once(first_run_silent: bool) -> None:
     changed = [it for it in found.values()
                if seen.get(it["id"]) and it["price"] and it["price"] != seen[it["id"]]]
 
-    # Новый город в CITIES — его текущие объявления тоже запоминаем без спама.
-    # В seen хранится метка «city:<название>» для уже знакомых городов.
+    # Новый город в CITIES или новый товар в KINDS — их текущие объявления тоже
+    # запоминаем без спама. В seen хранятся метки «city:<название>» и «kind:<код>»
+    # для уже знакомых городов и товаров.
     if not is_first and not any(s.startswith("city:") for s in seen):
         seen["city:Астана"] = None     # старый seen.json — Астана уже знакома
+    if not is_first and not any(s.startswith("kind:") for s in seen):
+        seen["kind:pc"] = None         # старый seen.json — раньше искали только ПК
     if not is_first and first_run_silent:
-        fresh = [c for c in CITIES if f"city:{c}" not in seen]
-        silent = [it for it in new if it.get("city") in fresh]
+        fresh_cities = [c for c in CITIES if f"city:{c}" not in seen]
+        fresh_kinds = [k for k in KINDS if f"kind:{k}" not in seen]
+        is_fresh = lambda it: it.get("city") in fresh_cities or it.get("kind") in fresh_kinds  # noqa: E731
+        silent = [it for it in new if is_fresh(it)]
         if silent:
-            print(f"Первый запуск для {', '.join(fresh)}: найденные объявления (без уведомлений):")
+            names = fresh_cities + [KINDS[k] for k in fresh_kinds]
+            print(f"Первый запуск для {', '.join(names)}: найденные объявления (без уведомлений):")
             for it in silent:
                 print(f"  {fmt_price(it['price']):>15} | {it['city']} | {it['title'][:60]} | {it['url']}")
-        new = [it for it in new if it.get("city") not in fresh]
+        new = [it for it in new if not is_fresh(it)]
     for c in CITIES:
         seen.setdefault(f"city:{c}", None)
-    # Сначала города в порядке CITIES (Астана, потом Алматы), внутри — от дешёвых к дорогим
+    for k in KINDS:
+        seen.setdefault(f"kind:{k}", None)
+    # Сначала ПК, потом PS5 Pro; внутри — Астана, потом Алматы; внутри — от дешёвых к дорогим
+    kind_order = {k: i for i, k in enumerate(KINDS)}
     city_order = {c: i for i, c in enumerate(CITIES)}
-    order = lambda it: (city_order.get(it.get("city"), len(CITIES)), it["price"] or 10**12)  # noqa: E731
+    order = lambda it: (kind_order.get(it.get("kind"), len(KINDS)),  # noqa: E731
+                        city_order.get(it.get("city"), len(CITIES)), it["price"] or 10**12)
     new.sort(key=order)
     changed.sort(key=order)
 
@@ -426,7 +470,7 @@ def main() -> None:
             stream.reconfigure(errors="replace")
         except AttributeError:
             pass
-    ap = argparse.ArgumentParser(description="Поиск ПК в Астане и Алматы на OLX")
+    ap = argparse.ArgumentParser(description="Поиск ПК и PS5 Pro в Астане и Алматы на OLX")
     ap.add_argument("--loop", type=int, default=0, help="повторять каждые N минут")
     ap.add_argument("--notify-all", action="store_true",
                     help="на первом запуске тоже слать всё в Telegram")
